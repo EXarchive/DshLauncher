@@ -4,6 +4,15 @@
 
 > ⬇️ **下载：[Releases](../../releases)** —— 取 `DshLauncher.exe`，单个文件，无需安装 .NET 运行时。
 
+## 生态定位
+
+DeepSeek Harness 的设计理念是「万物皆插件」，桌面端同样属于这个插件生态
+（参见同类项目 [anywhere-labs/dsh-desktop](https://github.com/anywhere-labs/dsh-desktop)）。
+
+本仓库归类标签：
+
+`dsh-plugin` · `deepseek-harness` · `dsh` · `dsh-desktop` · `launcher` · `wpf` · `windows` · `single-file`
+
 ---
 
 ## 这是什么
