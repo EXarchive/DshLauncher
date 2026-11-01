@@ -1,0 +1,144 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <PlatformTarget>x64</PlatformTarget>
+    <ApplicationTitle>DSH Launcher &amp; Controller</ApplicationTitle>
+    <AssemblyName>DshLauncher</AssemblyName>
+    <RootNamespace>DshLauncher</RootNamespace>
+    <Version>1.0.0</Version>
+    <Authors>DeepSeek Harness Community</Authors>
+    <Description>DSH (DeepSeek Harness) Single EXE GUI Launcher &amp; Service Controller</Description>
+    <!-- exe 在资源管理器 / 任务栏 / Alt+Tab 上显示的图标（多尺寸 ICO，含 256px） -->
+    <ApplicationIcon>DshLauncher.ico</ApplicationIcon>
+    <!-- DPI 感知声明（PerMonitorV2）。缺了它，内嵌 WebView2 在 150% 缩放下会把网页
+         按 1x 栅格化，看起来「界面是对的、只是被缩得极小」。详见 app.manifest。 -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <NoWarn>$(NoWarn);NU1701;MSB3277</NoWarn>
+  </PropertyGroup>
+
+  <!-- ===================== 单一可执行文件（single-file）=====================
+       WPF 反射/绑定依赖程序集元数据，裁剪会直接打断 XAML 绑定与反射查找，
+       所以 PublishTrimmed 必须保持 false（显式写出来，防止被全局属性打开）。 -->
+  <PropertyGroup>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- 自包含（免装运行时的单 exe）在本机【做不到】，所以默认关闭。
+         它需要 NuGet 上的 3 个 runtime pack：
+           Microsoft.NETCore.App.Runtime.win-x64 / Microsoft.WindowsDesktop.App.Runtime.win-x64 / AspNetCore...
+         实测：SDK 的 C:\Program Files\dotnet\packs 里没有它们（只有 *Ref 编译包），
+         用户级 NuGet 缓存里也没有，而 nuget.org 被策略代理挡住(403)。
+         默认 true 会让一个裸 `dotnet build` 直接 NU1301 失败 —— 实际踩过。
+         联网后想出自包含单 exe，显式打开即可：
+           dotnet publish src\DshLauncher.csproj -c Release -o dist-selfcontained -p:SelfContained=true
+         当前默认产出框架依赖的单 exe：仍然只有 1 个文件，但目标机需装
+         .NET 9 Desktop Runtime（本机 9.0.19）。 -->
+    <SelfContained Condition="'$(SelfContained)' == ''">false</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- PublishSingleFile 会推断 EnableSingleFileAnalyzer=true，而该分析器把
+         NuGet 上的 Microsoft.NET.ILLink.Tasks 变成必需项(见 SDK 的
+         Microsoft.NET.Publish.targets _RequiresILLinkPack) —— 离线机器没有这个包，
+         restore 直接 NU1301 失败。关掉只丢"某文件没进单文件包"的构建期告警，
+         不影响产物；本项目已用 IncludeAllContentForSelfExtract 显式处理内容文件。 -->
+    <EnableSingleFileAnalyzer>false</EnableSingleFileAnalyzer>
+    <!-- WebView2Loader.dll 是非托管库：必须随包自解包，否则运行时 DllNotFound。 -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- 压缩只在自包含时合法（SelfContained=false 会报 NETSDK1176），所以跟 SelfContained 绑定。 -->
+    <EnableCompressionInSingleFile Condition="'$(SelfContained)' == 'true'">true</EnableCompressionInSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <!-- 本工程的 WebView2Loader.dll 走 HintPath(None+CopyToOutputDirectory)=内容文件，
+         内容文件默认不进单文件包（会散落在 exe 旁边），这里强制连内容一起打包自解包。 -->
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <!-- 调试符号嵌进 exe，dist-single 里不出现散落的 .pdb。 -->
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <!-- WebView2 (Chromium/Edge) 本地 SDK 引用：完全离线，无需 NuGet 联网还原 -->
+  <ItemGroup>
+    <Reference Include="Microsoft.Web.WebView2.Core">
+      <HintPath>lib\Microsoft.Web.WebView2.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.Web.WebView2.Wpf">
+      <HintPath>lib\Microsoft.Web.WebView2.Wpf.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="lib\WebView2Loader.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>WebView2Loader.dll</Link>
+    </None>
+  </ItemGroup>
+
+  <!-- ===================== 运行时数据（嵌入资源）=====================
+       单文件 exe 旁边没有 tools\ 和 rescue\profile\，node/pwsh 又必须拿到磁盘上的真实路径，
+       所以这些文件嵌进程序集，由 src\Services\EmbeddedAssets.cs 解包到
+       %LOCALAPPDATA%\DshLauncher\assets\（稳定路径 + 内容标记守卫）。
+       LogicalName 必须与 EmbeddedAssets.cs 里那张映射表逐字一致。
+       注意：rescue\dsh\（约 212.7 MB 的 DSH 包快照）**不嵌入原始目录树**，
+       而是把已压缩好的 rescue\rescue-snapshot.zip（约 61.4 MB）整包嵌入，
+       由 EmbeddedAssets.EnsureRescueSnapshot() 在救援面板首次用到时懒解包。 -->
+  <!-- 图标同时内嵌为 WPF Resource，供各窗口的 Icon 属性用 pack URI 引用。
+       ApplicationIcon 只管 exe 外壳；窗口标题栏/任务栏要单独设 Icon 才稳。 -->
+  <ItemGroup>
+    <Resource Include="DshLauncher.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\tools\*.mjs">
+      <LogicalName>DshLauncher.Assets.tools.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\tools\rescue-dsh.ps1">
+      <LogicalName>DshLauncher.Assets.tools.rescue-dsh.ps1</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\rescue\profile\package.json">
+      <LogicalName>DshLauncher.Assets.rescue.profile.package.json</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\rescue\profile\cordis.patch.yml">
+      <LogicalName>DshLauncher.Assets.rescue.profile.cordis.patch.yml</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\rescue\profile\cordis.yml">
+      <LogicalName>DshLauncher.Assets.rescue.profile.cordis.yml</LogicalName>
+    </EmbeddedResource>
+    <!-- 救援快照（压缩 zip，非原始目录树）：含 dsh\ + profile\ + manifest.json，
+         由 EmbeddedAssets.EnsureRescueSnapshot() 懒解包。 -->
+    <EmbeddedResource Include="..\rescue\rescue-snapshot.zip">
+      <LogicalName>DshLauncher.Assets.rescue.snapshot.zip</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!-- ============ 应用图标：每次构建都必须带上 ============
+       ApplicationIcon 本身已经让每次 build/publish 自动嵌入图标，但 src\DshLauncher.ico
+       是**生成产物**。它一旦丢失（清理、换机器、重新克隆），构建不会报错，只会安静地产出
+       一个没有图标的 exe —— 这种静默降级正是这个 Target 要堵住的：
+
+         图标在      → 什么都不做（不调用 node，构建不受影响）
+         图标不在    → 用 design\build-mascot-icon.mjs 现场重新生成
+         生成不出来  → **直接报错中断构建**，绝不放行一个没图标的产物
+
+       生成需要 design\mascot-src.png（素材）与 node。 -->
+  <Target Name="EnsureAppIcon" BeforeTargets="BeforeBuild;BeforeRebuild">
+    <PropertyGroup>
+      <_IconFile>$(MSBuildProjectDirectory)\DshLauncher.ico</_IconFile>
+      <_IconScript>$(MSBuildProjectDirectory)\..\design\build-mascot-icon.mjs</_IconScript>
+      <_IconSource>$(MSBuildProjectDirectory)\..\design\mascot-src.png</_IconSource>
+    </PropertyGroup>
+
+    <Message Importance="high" Condition="Exists('$(_IconFile)')"
+             Text="[icon] DshLauncher.ico 就位（$([System.IO.File]::GetLastWriteTime('$(_IconFile)').ToString('MM-dd HH:mm')))" />
+
+    <Warning Condition="!Exists('$(_IconFile)')" Text="[icon] 图标缺失，尝试从 design\ 重新生成…" />
+    <Exec Condition="!Exists('$(_IconFile)') And Exists('$(_IconScript)') And Exists('$(_IconSource)')"
+          Command="node &quot;$(_IconScript)&quot; ico navy"
+          ContinueOnError="true" />
+
+    <Error Condition="!Exists('$(_IconFile)')"
+           Text="应用图标缺失且无法自动生成：$(_IconFile)&#10;请确认存在 design\mascot-src.png 与 node，然后运行：&#10;    node design\build-mascot-icon.mjs ico navy&#10;（这个错误是刻意中断构建的：宁可构建失败，也不要产出一个没有图标的 exe）" />
+  </Target>
+
+</Project>

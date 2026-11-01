@@ -1,0 +1,23 @@
+# The rescue profile's own patch layer. It is deliberately EMPTY, and that is a
+# design decision, not an omission.
+#
+# WHY NO PLUGIN ROWS HERE
+# -----------------------
+# The working e2e profile mounts dsh-supervise by absolute file:// path because
+# cordis-plugin-hmr skips node_modules, so only a path-mounted plugin hot
+# reloads. That reason does not exist for a rescue:
+#
+#   1. The rescue runs ONE headless task and exits. There is nothing to hot
+#      reload: patchReload is "startup" (the shipped headless template's own
+#      value), so dsh boot does not even inject the hmr/timer loader rows.
+#   2. A path-mounted row would add a second thing that must be snapshotted and
+#      that can rot: the plugin's own tree plus its dependencies. The rescue's
+#      whole point is having as few moving parts as possible, so that a broken
+#      main install is the only thing that can be wrong.
+#   3. Supervision (leases, watchdogs, a supervised cluster) is the LAUNCHER's
+#      job, not the rescue's. A rescue that tried to supervise would depend on
+#      the very supervision state it may be repairing.
+#
+# So: bundles only (@deepseek-ai/dsh-base + @deepseek-ai/dsh-headless), mounted
+# from the snapshot's own core layer, plus nothing else.
+[]

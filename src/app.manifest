@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="DshLauncher.app" />
+
+  <!--
+    DPI 感知声明 —— 内嵌 WebView2 在非 100% 缩放下「界面是对的、只是被缩得极小」的根因。
+
+    没有这个声明时，宿主 WPF 与 WebView2 对「1 个设备无关像素等于几个物理像素」的
+    判断会不一致：WPF 自己的控件（边框、按钮）按系统缩放放大，而 WebView2 里的网页
+    仍按 1x 栅格化 —— 结果就是页面内容比周围小一大截。
+    本机为 2560x1600 @ 150%，正是会出现该现象的场合。
+
+    PerMonitorV2：每个显示器各按自己的 DPI 渲染，拖动窗口跨屏时两边一起更新。
+    同时保留 2005 版的 dpiAware，兼容旧系统。
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+</assembly>

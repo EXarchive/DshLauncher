@@ -1,0 +1,231 @@
+<UserControl x:Class="DshLauncher.RescuePanel"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:local="clr-namespace:DshLauncher"
+             mc:Ignorable="d"
+             d:DesignWidth="440"
+             Background="#141517">
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         「DSH 救援」内嵌侧栏 —— 最小聊天界面，取代原来的按钮农场。
+         用户直接对一个独立的、一次性的 DSH 救援实例说话；会话修复由 agent
+         自己跑工具（pwsh / run_code / session-manager.mjs）完成，而不是点「修复」按钮。
+         布局（自上而下）：状态行 → 对话日志 → 凭据提示 → 输入行 → 忙碌条 → 三个次要动作。
+         ══════════════════════════════════════════════════════════════════════ -->
+
+    <UserControl.Resources>
+
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+
+        <!-- ── 通用暗色按键 ─────────────────────────────────────────────── -->
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="#21262D"/>
+            <Setter Property="Foreground" Value="#C9D1D9"/>
+            <Setter Property="BorderBrush" Value="#30363D"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="10,4"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="b" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="b" Property="Background" Value="#30363D"/>
+                                <Setter Property="Foreground" Value="#FFFFFF"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="b" Property="Opacity" Value="0.45"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ── 发送（主强调色） ─────────────────────────────────────────── -->
+        <Style x:Key="SendBtn" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#2D72F6"/>
+            <Setter Property="BorderBrush" Value="#2D72F6"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Padding" Value="14,7"/>
+        </Style>
+
+        <!-- ── 次要动作（不显眼：透明底、细边框、小字号） ────────────────── -->
+        <Style x:Key="GhostBtn" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="#30363D"/>
+            <Setter Property="Foreground" Value="#8B949E"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Padding" Value="9,3"/>
+        </Style>
+
+        <!-- ── 暗色输入框（多行，Enter 发送 / Shift+Enter 换行） ─────────── -->
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#1E2023"/>
+            <Setter Property="Foreground" Value="#E6EDF3"/>
+            <Setter Property="BorderBrush" Value="#30363D"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="CaretBrush" Value="#2D72F6"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6">
+                            <ScrollViewer x:Name="PART_ContentHost" Margin="0"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ── 忙碌进度条 ───────────────────────────────────────────────── -->
+        <Style x:Key="BusyBar" TargetType="ProgressBar">
+            <Setter Property="Height" Value="4"/>
+            <Setter Property="Background" Value="#21262D"/>
+            <Setter Property="Foreground" Value="#2D72F6"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+
+        <!-- ── 对话气泡模板：默认=助手（左、等宽），用户=右/蓝，系统=通栏/弱化 ── -->
+        <DataTemplate x:Key="MessageTemplate" DataType="{x:Type local:ChatMessage}">
+            <Grid Margin="0,3">
+                <Border x:Name="Bubble" CornerRadius="8" Padding="10,7" MaxWidth="320"
+                        HorizontalAlignment="Left" Background="#21262D" BorderBrush="#30363D" BorderThickness="1"
+                        ToolTip="{Binding ToolTip}">
+                    <TextBlock x:Name="Txt" Text="{Binding Text}" TextWrapping="Wrap" FontSize="12"
+                               Foreground="#E6EDF3"
+                               FontFamily="Cascadia Code, Consolas, Microsoft YaHei UI"/>
+                </Border>
+            </Grid>
+            <DataTemplate.Triggers>
+                <DataTrigger Binding="{Binding IsUser}" Value="True">
+                    <Setter TargetName="Bubble" Property="HorizontalAlignment" Value="Right"/>
+                    <Setter TargetName="Bubble" Property="Background" Value="#2D72F6"/>
+                    <Setter TargetName="Bubble" Property="BorderBrush" Value="#2D72F6"/>
+                    <Setter TargetName="Txt" Property="Foreground" Value="White"/>
+                    <Setter TargetName="Txt" Property="FontFamily" Value="Microsoft YaHei UI"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsSystem}" Value="True">
+                    <Setter TargetName="Bubble" Property="HorizontalAlignment" Value="Stretch"/>
+                    <Setter TargetName="Bubble" Property="MaxWidth" Value="100000"/>
+                    <Setter TargetName="Bubble" Property="Background" Value="#1A1C1F"/>
+                    <Setter TargetName="Bubble" Property="BorderBrush" Value="#26282B"/>
+                    <Setter TargetName="Txt" Property="Foreground" Value="#8B949E"/>
+                </DataTrigger>
+                <!-- 思考消息：弱化、偏灰、可折叠感，与完整 DSH 的「思考」块视觉一致 -->
+                <DataTrigger Binding="{Binding IsThinking}" Value="True">
+                    <Setter TargetName="Bubble" Property="Background" Value="#1A1C1F"/>
+                    <Setter TargetName="Bubble" Property="BorderBrush" Value="#26282B"/>
+                    <Setter TargetName="Txt" Property="Foreground" Value="#7D8590"/>
+                    <Setter TargetName="Txt" Property="FontFamily" Value="Microsoft YaHei UI"/>
+                </DataTrigger>
+                <!-- 操作：工具调用/结果，等宽、偏蓝底，与完整 DSH 的「工具操作」视觉一致 -->
+                <DataTrigger Binding="{Binding IsTool}" Value="True">
+                    <Setter TargetName="Bubble" Property="MaxWidth" Value="100000"/>
+                    <Setter TargetName="Bubble" Property="Background" Value="#0D1117"/>
+                    <Setter TargetName="Bubble" Property="BorderBrush" Value="#1F6FEB"/>
+                    <Setter TargetName="Txt" Property="Foreground" Value="#9ECBFF"/>
+                </DataTrigger>
+            </DataTemplate.Triggers>
+        </DataTemplate>
+
+    </UserControl.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>   <!-- 0: 状态行（快照 + 模型） -->
+            <RowDefinition Height="*" MinHeight="120"/> <!-- 1: 对话日志 -->
+            <RowDefinition Height="Auto"/>   <!-- 2: 凭据提示（永久、单行） -->
+            <RowDefinition Height="Auto"/>   <!-- 3: 输入行 -->
+            <RowDefinition Height="Auto"/>   <!-- 4: 忙碌条 + 提示 -->
+            <RowDefinition Height="Auto"/>   <!-- 5: 三个次要动作 -->
+        </Grid.RowDefinitions>
+
+        <!-- ══════════════ 0. 状态行 ══════════════ -->
+        <Border Grid.Row="0" Background="#18191B" BorderBrush="#26282B" BorderThickness="0,0,0,1" Padding="10,5">
+            <DockPanel LastChildFill="True">
+                <TextBlock DockPanel.Dock="Right" Text="{Binding ModelRouteText}" Foreground="#8B949E"
+                           FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding ModelRouteText}"/>
+                <TextBlock Text="{Binding SnapshotStateText}" Foreground="#C9D1D9" FontSize="11"
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding SnapshotStateText}"/>
+            </DockPanel>
+        </Border>
+
+        <!-- ══════════════ 1. 对话日志 ══════════════ -->
+        <Grid Grid.Row="1">
+            <ScrollViewer x:Name="ChatScroll" VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled" Padding="10,8">
+                <ItemsControl ItemsSource="{Binding Messages}" ItemTemplate="{StaticResource MessageTemplate}"/>
+            </ScrollViewer>
+
+            <TextBlock x:Name="EmptyHint"
+                       Text="直接对救援 DSH 说话。例：『扫描所有会话，修复损坏的』。"
+                       Foreground="#6E7681" FontSize="12" TextWrapping="Wrap" TextAlignment="Center"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" Margin="20" MaxWidth="300"
+                       Visibility="{Binding ShowEmptyHint, Converter={StaticResource BoolToVis}}"/>
+        </Grid>
+
+        <!-- ══════════════ 2. 凭据提示（安全事实，永久显示，绝不隐藏） ══════════════ -->
+        <Border Grid.Row="2" Background="#241F12" BorderBrush="#6B5210" BorderThickness="0,1,0,0" Padding="10,5">
+            <TextBlock Text="⚠ 救援 DSH 需要模型凭据，已在救援目录保留一份 API key 副本。"
+                       Foreground="#F0D58C" FontSize="10.5" TextWrapping="Wrap"/>
+        </Border>
+
+        <!-- ══════════════ 3. 输入行 ══════════════ -->
+        <Border Grid.Row="3" Background="#18191B" BorderBrush="#26282B" BorderThickness="0,1,0,0" Padding="10,8">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBox x:Name="TxtInput" Grid.Column="0"
+                         AcceptsReturn="True" TextWrapping="Wrap"
+                         MinHeight="34" MaxHeight="120" VerticalScrollBarVisibility="Auto"
+                         IsEnabled="{Binding CanSend}"
+                         PreviewKeyDown="TxtInput_PreviewKeyDown"
+                         ToolTip="Enter 发送，Shift+Enter 换行"/>
+                <Button x:Name="BtnSend" Grid.Column="1" Content="发送" Style="{StaticResource SendBtn}"
+                        Margin="8,0,0,0" VerticalAlignment="Bottom"
+                        Click="BtnSend_Click" IsEnabled="{Binding CanSend}"/>
+            </Grid>
+        </Border>
+
+        <!-- ══════════════ 4. 忙碌条 + 「…」提示 ══════════════ -->
+        <StackPanel Grid.Row="4">
+            <ProgressBar Style="{StaticResource BusyBar}" IsIndeterminate="{Binding IsBusy}"
+                         Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}"/>
+            <TextBlock Text="{Binding BusyHint}" Foreground="#79B8FF" FontSize="11" Margin="10,4,10,0"
+                       Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}"/>
+        </StackPanel>
+
+        <!-- ══════════════ 5. 三个次要动作（不显眼） ══════════════ -->
+        <Border Grid.Row="5" Background="#18191B" BorderBrush="#26282B" BorderThickness="0,1,0,0">
+            <StackPanel Orientation="Horizontal" Margin="10,6,10,8">
+                <Button Content="重建快照" Style="{StaticResource GhostBtn}" Margin="0,0,6,0"
+                        Click="BtnRebuild_Click"
+                        ToolTip="create：把本机 DSH 安装复制成救援快照（约 200+ MB，不含会话与工作区）"/>
+                <Button Content="清空对话" Style="{StaticResource GhostBtn}" Margin="0,0,6,0"
+                        Click="BtnClearChat_Click"
+                        ToolTip="清空当前对话与上下文历史（本地操作，不触发模型）"/>
+                <Button Content="体检" Style="{StaticResource GhostBtn}"
+                        Click="BtnHealth_Click"
+                        ToolTip="status：复查快照完整性与可用性结论"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</UserControl>

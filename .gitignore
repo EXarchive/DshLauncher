@@ -1,0 +1,18 @@
+# ── 构建产物（体积大、可重建）──
+dist/
+dist-staging/
+dist-selfcontained/
+src/bin/
+src/obj/
+*.user
+*.suo
+
+# ── 离线 NuGet feed（82.9MB，用 deploy\build-packs.ps1 可重建）──
+.runtimepacks/
+
+# ── 救援快照（61.4MB，运行时生成）──
+rescue/rescue-snapshot.zip
+
+# ── 临时文件 ──
+src/_probe_shell.txt
+*.tmp
