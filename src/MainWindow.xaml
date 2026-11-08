@@ -297,7 +297,9 @@
 
                         <!-- Primary Start Button (DeepSeek Accent Blue) -->
                         <Button x:Name="BtnStart" Content="启动" Background="#2D72F6" Foreground="#FFFFFF" BorderBrush="#2D72F6" Width="60" Height="26" Margin="0,0,6,0" Click="BtnStart_Click"/>
-                        <Button x:Name="BtnStop" Content="停止" Width="60" Height="26" IsEnabled="False" Margin="0,0,8,0" Click="BtnStop_Click"/>
+                        <Button x:Name="BtnStop" Content="停止" Width="60" Height="26" IsEnabled="False" Margin="0,0,6,0" Click="BtnStop_Click"/>
+                        <Button x:Name="BtnForcePort" Content="🔓 释放端口" Height="26" Margin="0,0,8,0" Click="BtnForcePort_Click"
+                                ToolTip="强制结束所有占用 Web 端口的进程（含 SYSTEM 进程与子树）。用于端口被残留实例占住、又不归本启动器管理的情况——普通「停止」对此无效"/>
                     </StackPanel>
 
                     <!-- Right: Tool Actions -->

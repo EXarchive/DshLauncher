@@ -384,8 +384,8 @@ public partial class SessionsWindow : Window
 
     private async void BtnRefresh_Click(object sender, RoutedEventArgs e)
     {
-        if (_busy > 0) { AppendLog("[提示]", "已有命令在执行，请稍候。", true); return; }
-        await RefreshListAsync();
+        try { await RefreshListAsync(); }
+        catch (Exception ex) { Safe.Report("SessionsWindow.BtnRefresh_Click", ex); }
     }
 
     private void FilterToggle_Click(object sender, RoutedEventArgs e) => ApplyFilter();
@@ -998,6 +998,12 @@ public partial class SessionsWindow : Window
 
     private async void BtnScan_Click(object sender, RoutedEventArgs e)
     {
+        try { await BtnScanCoreAsync(); }
+        catch (Exception ex) { Safe.Report("SessionsWindow.BtnScan_Click", ex); }
+    }
+
+    private async Task BtnScanCoreAsync()
+    {
         if (_busy > 0) { AppendLog("[提示]", "已有命令在执行，请稍候。", true); return; }
 
         PostToUi(() => { TxtStatus.Text = "正在体检扫描（逐条校验帧边界）…"; });
@@ -1056,8 +1062,12 @@ public partial class SessionsWindow : Window
 
     private async void BtnQuarantineRefresh_Click(object sender, RoutedEventArgs e)
     {
-        if (_busy > 0) { AppendLog("[提示]", "已有命令在执行，请稍候。", true); return; }
-        await RefreshQuarantineAsync();
+        try
+        {
+            if (_busy > 0) { AppendLog("[提示]", "已有命令在执行，请稍候。", true); return; }
+            await RefreshQuarantineAsync();
+        }
+        catch (Exception ex) { Safe.Report("SessionsWindow.BtnQuarantineRefresh_Click", ex); }
     }
 
     private void BatchList_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1116,6 +1126,12 @@ public partial class SessionsWindow : Window
 
     private async void BtnRestoreBatch_Click(object sender, RoutedEventArgs e)
     {
+        try { await BtnRestoreBatchCoreAsync(); }
+        catch (Exception ex) { Safe.Report("SessionsWindow.BtnRestoreBatch_Click", ex); }
+    }
+
+    private async Task BtnRestoreBatchCoreAsync()
+    {
         if (_busy > 0) { AppendLog("[提示]", "已有命令在执行，请稍候。", true); return; }
         if (BatchList.SelectedItem is not BatchRow row)
         {
@@ -1149,6 +1165,12 @@ public partial class SessionsWindow : Window
     }
 
     private async void BtnPurgeBatch_Click(object sender, RoutedEventArgs e)
+    {
+        try { await BtnPurgeBatchCoreAsync(); }
+        catch (Exception ex) { Safe.Report("SessionsWindow.BtnPurgeBatch_Click", ex); }
+    }
+
+    private async Task BtnPurgeBatchCoreAsync()
     {
         if (_busy > 0) { AppendLog("[提示]", "已有命令在执行，请稍候。", true); return; }
         if (BatchList.SelectedItem is not BatchRow row)
@@ -1289,12 +1311,14 @@ public partial class SessionsWindow : Window
         if (_closed) return;
         try
         {
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
             if (Dispatcher.CheckAccess()) action();
             else Dispatcher.Invoke(action);
         }
         catch (TaskCanceledException) { }
         // ObjectDisposedException 派生自 InvalidOperationException，一并由这里兜住（关窗时可能随手抛）
         catch (InvalidOperationException) { }
+        catch (Exception ex) { Safe.Report("SessionsWindow.PostToUi", ex); }
     }
 
     private void AppendLog(string tag, string message, bool isError)

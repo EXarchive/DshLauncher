@@ -86,6 +86,10 @@ public sealed class PrivilegeLauncher : IDisposable
             ChildPid = null;
 
             // Fresh run: old output would otherwise be replayed as if it just happened.
+            // 但**不能直接删**：上一次如果是崩溃退出，dsh.err.log 里就留着崩溃原因，
+            // 删掉等于把现场毁了（2026-11-06 就是这么查不到 node 为什么退出的）。
+            // 先归档，再清空。
+            ArchivePreviousLogs();
             foreach (string f in new[] { _logOut, _logErr, _pidFile }) TryDelete(f);
 
             WriteConfig(fileName, arguments, workDir, config, port);
@@ -139,8 +143,12 @@ public sealed class PrivilegeLauncher : IDisposable
 
     public async Task<bool> StopAsync()
     {
-        bool elevatedChild = ChildPid.HasValue;
-        bool needUac = elevatedChild && !LauncherIsElevated;
+        // 只要启动器本身没提权、而目标可能是提权实例，就需要 UAC。
+        // 旧实现用「是否记录了 ChildPid」来判断，于是兜底场景（ChildPid 为空，
+        // 例如状态被误判后再次停止、或换了新的 PrivilegeLauncher 来善后）会以
+        // 非提权方式执行停止脚本 —— 而脚本里 $ErrorActionPreference="SilentlyContinue"，
+        // 杀不掉 SYSTEM 进程也不报错，表现为「点了停止没反应」。
+        bool needUac = !LauncherIsElevated;
 
         if (File.Exists(_stopScript))
         {
@@ -172,6 +180,11 @@ public sealed class PrivilegeLauncher : IDisposable
         if (config.CustomEnv != null)
             foreach (var kv in config.CustomEnv)
                 if (!string.IsNullOrWhiteSpace(kv.Key)) env[kv.Key] = kv.Value;
+
+        // Node 堆上限：用户要求「内存无上限」，把约束交给操作系统。
+        // 放在 CustomEnv 之后，用户自己设的 NODE_OPTIONS 会被尊重（只追加不覆盖）。
+        env.TryGetValue(NodeMemoryOptions.EnvName, out var existingNodeOpts);
+        env[NodeMemoryOptions.EnvName] = NodeMemoryOptions.BuildValue(existingNodeOpts);
 
         string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string dshHome = Environment.GetEnvironmentVariable("DSH_HOME") ?? "";
@@ -350,10 +363,23 @@ $c = Get-Content (Join-Path $Dir "launch.json") -Raw -Encoding UTF8 | ConvertFro
 
 # Kill by port first: it is the only signal that is correct even if the PID file was
 # never written (e.g. the host script died mid-way).
+# NOTE: Get-NetTCPConnection 在提权/SYSTEM 上下文里会漏报（实测端口明明在监听却返回空），
+# 改用 netstat -ano 解析，命中率最高。
 $port = 3085
 try { $port = [int]$c.port } catch {}
-Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
-    ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+$suffix = ":$port"
+netstat -ano | ForEach-Object {
+    $t = $_.Trim()
+    if ($t -notmatch '^TCP') { return }
+    $cols = $t -split '\s+'
+    if ($cols.Count -lt 5) { return }
+    if (-not $cols[1].EndsWith($suffix)) { return }
+    if ($cols[3] -ne 'LISTENING') { return }
+    $procId = 0
+    if ([int]::TryParse($cols[4], [ref]$procId) -and $procId -gt 0) {
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # Then by recorded PID, with /T so node's own children go too.
 $pidFile = Join-Path $Dir "node.pid"
@@ -460,16 +486,205 @@ exit 0
         catch { return false; }
     }
 
-    public static bool IsPortListening(int port)
+    /// <summary>公开的 PID 读取（供外部对比「端口监听者是不是我自己」）。</summary>
+    public bool TryGetPid(out int pid) => TryReadPid(out pid);
+
+    /// <summary>
+    /// 查出正在 LISTEN 指定端口的进程 PID；查不到返回 null。
+    ///
+    /// 为什么不用 IPGlobalProperties / Get-NetTCPConnection：
+    ///   · GetActiveTcpListeners() 只给 endpoint，不带 PID；
+    ///   · Get-NetTCPConnection 在提权/SYSTEM 上下文里会漏报（实测 19:44 该端口
+    ///     明明在监听，它却返回空）。
+    /// netstat -ano 是命中率最高的一个。
+    /// </summary>
+    public static int? FindPortOwnerPid(int port)
     {
         try
         {
-            var props = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties();
-            foreach (var ep in props.GetActiveTcpListeners())
-                if (ep.Port == port) return true;
+            var psi = new ProcessStartInfo("netstat", "-ano")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return null;
+
+            string output = p.StandardOutput.ReadToEnd();
+            try { p.WaitForExit(4000); } catch { }
+
+            string suffix = ":" + port;
+            int? establishedPid = null;
+
+            foreach (string raw in output.Split('\n'))
+            {
+                string line = raw.Trim();
+                if (!line.StartsWith("TCP", StringComparison.OrdinalIgnoreCase)) continue;
+
+                string[] cols = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                if (cols.Length < 5) continue;
+                if (!cols[1].EndsWith(suffix, StringComparison.Ordinal)) continue;
+
+                // 本环境下 node 的监听可能只出现在 ESTABLISHED 行、没有 LISTENING 行，
+                // 所以两种状态都收；LISTENING 优先，ESTABLISHED 作为回退。
+                bool isListening = cols[3].Equals("LISTENING", StringComparison.OrdinalIgnoreCase);
+                bool isEstablished = cols[3].Equals("ESTABLISHED", StringComparison.OrdinalIgnoreCase);
+                if (!isListening && !isEstablished) continue;
+
+                if (int.TryParse(cols[4], out int pid) && pid > 0)
+                {
+                    if (isListening) return pid;
+                    establishedPid ??= pid;
+                }
+            }
+
+            return establishedPid;
         }
         catch { }
+        return null;
+    }
+
+    /// <summary>
+    /// 提权实例是否仍然活着：读 node.pid 并确认该 PID 对应进程还在。
+    ///
+    /// 这是「端口监听」之外的第二存活信号。个别环境下
+    /// IPGlobalProperties.GetActiveTcpListeners() 会漏掉目标端口，
+    /// 若只凭端口判死，活着的实例会被误标成「已停止」且无法再停止
+    /// （Stopped 状态会把停止按钮禁用）。
+    /// </summary>
+    public bool IsProcessAlive()
+    {
+        if (!TryReadPid(out int pid)) return false;
+        try
+        {
+            using var p = System.Diagnostics.Process.GetProcessById(pid);
+            return !p.HasExited;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// 探测端口是否真的在服务。
+    ///
+    /// **不能只用 GetActiveTcpListeners()**：2026-11-06 实测，在当前环境下 node 的
+    /// 监听对它返回空，`netstat -ano` 也只有 ESTABLISHED、**没有 LISTENING 行**，
+    /// 但端口完全可用（HTTP 请求能拿到 401 鉴权响应）。据此判活会导致
+    /// 「明明在跑却判死 → 反复重启」的死循环。
+    ///
+    /// **也不能用 BeginConnect + 超时后 Dispose**：超时那一刻 socket 被关，
+    /// 未完成的异步连接抛 SocketException(995 WSA_OPERATION_ABORTED)，
+    /// 落到线程池成为未观察异常（实测 crash 日志里刷了一堆）。
+    ///
+    /// 这里用「非阻塞 connect + Poll 等待可写」：全程同步，不产生挂起的异步操作。
+    /// </summary>
+    public static bool IsPortListening(int port)
+    {
+        // ① 主动连接探测（最可靠，不受 netstat 显示问题影响）
+        try
+        {
+            using var sock = new System.Net.Sockets.Socket(
+                System.Net.Sockets.AddressFamily.InterNetwork,
+                System.Net.Sockets.SocketType.Stream,
+                System.Net.Sockets.ProtocolType.Tcp);
+
+            sock.Blocking = false;
+            try
+            {
+                sock.Connect(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, port));
+            }
+            catch (System.Net.Sockets.SocketException se)
+            {
+                // 非阻塞 connect 的"进行中"不是错误
+                if (se.SocketErrorCode != System.Net.Sockets.SocketError.TimedOut &&
+                    se.SocketErrorCode != System.Net.Sockets.SocketError.InProgress &&
+                    se.SocketErrorCode != System.Net.Sockets.SocketError.WouldBlock &&
+                    se.SocketErrorCode != System.Net.Sockets.SocketError.AlreadyInProgress)
+                {
+                    // 连接被拒绝等：端口确实没在服务
+                    return false;
+                }
+            }
+
+            // 可写 = 三次握手完成
+            if (sock.Poll(400_000, System.Net.Sockets.SelectMode.SelectWrite)) return true;
+        }
+        catch { }
+
+        // ② 回退：监听表里有该端口，或存在**已建立**连接（才算真的有实例在服务）
+        try
+        {
+            var props = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties();
+
+            foreach (var ep in props.GetActiveTcpListeners())
+                if (ep.Port == port) return true;
+
+            // ⚠ 必须限定 Established：GetActiveTcpConnections 同时包含 TIME_WAIT / Closed，
+            // 而进程崩溃后留下的 TIME_WAIT 是内核持有、没有进程在服务的。
+            // 之前不区分状态，导致「崩溃残留 TIME_WAIT」被误判成「端口仍被占用」，
+            // 于是明明能 bind 却被拒绝启动（2026-11-06 22:16 实测日志）。
+            foreach (var c in props.GetActiveTcpConnections())
+                if (c.LocalEndPoint.Port == port
+                    && c.State == System.Net.NetworkInformation.TcpState.Established)
+                    return true;
+        }
+        catch { }
+
         return false;
+    }
+
+    /// <summary>
+    /// 归档上一次运行的输出日志。
+    ///
+    /// 在此之前每次启动都会直接删除 dsh.log / dsh.err.log —— 如果上一次是**崩溃**退出，
+    /// 崩溃原因就随文件一起没了，事后完全无法定位（2026-11-06 实测：查不到 node 退出原因）。
+    /// 归档到 logs\sessions\ 并只保留最近若干份，既能留下现场又不会无限增长。
+    /// </summary>
+    private void ArchivePreviousLogs()
+    {
+        try
+        {
+            string archiveDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "DshLauncher", "logs", "sessions");
+            Directory.CreateDirectory(archiveDir);
+
+            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+
+            foreach (var item in new[] { (_logOut, "dsh.log"), (_logErr, "dsh.err.log") })
+            {
+                try
+                {
+                    string path = item.Item1;
+                    if (!File.Exists(path)) continue;
+                    if (new FileInfo(path).Length == 0) continue;   // 空文件没有归档价值
+
+                    File.Copy(path, Path.Combine(archiveDir, $"{stamp}-{item.Item2}"), overwrite: true);
+                }
+                catch { }
+            }
+
+            // 只保留最近 40 个文件（约 20 次启动）
+            try
+            {
+                var stale = Directory.GetFiles(archiveDir)
+                    .Select(p => new FileInfo(p))
+                    .OrderByDescending(f => f.LastWriteTimeUtc)
+                    .Skip(40)
+                    .ToList();
+
+                foreach (var f in stale)
+                {
+                    try { f.Delete(); } catch { }
+                }
+            }
+            catch { }
+        }
+        catch
+        {
+            // 归档失败绝不能影响启动
+        }
     }
 
     private static void TryDelete(string path)

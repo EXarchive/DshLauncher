@@ -358,14 +358,15 @@ public partial class RescuePanel : UserControl, INotifyPropertyChanged
 
     // ─────────────────────────── 对话回合 ───────────────────────────
 
-    private async void BtnSend_Click(object sender, RoutedEventArgs e) => await SendAsync();
+    private void BtnSend_Click(object sender, RoutedEventArgs e)
+        => Safe.FireAndForget("RescuePanel.BtnSend_Click", SendAsync);
 
     private void TxtInput_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key != Key.Enter) return;
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) return; // Shift+Enter = 换行
         e.Handled = true;
-        _ = SendAsync();
+        Safe.FireAndForget("RescuePanel.TxtInput_Enter", SendAsync);
     }
 
     private async Task SendAsync()
@@ -678,15 +679,23 @@ public partial class RescuePanel : UserControl, INotifyPropertyChanged
 
     private async void BtnRebuild_Click(object sender, RoutedEventArgs e)
     {
-        if (_busy > 0) return;
+        try
+        {
+            if (_busy > 0) return;
 
-        var answer = MessageBox.Show(HostWindow(),
-            "将把本机 DSH 安装复制成救援快照（复制代码，约 200+ MB；不含你的会话、工作区、存储与设置）。\n\n继续？",
-            "重建快照", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-        if (answer != MessageBoxResult.Yes) return;
+            var answer = MessageBox.Show(HostWindow(),
+                "将把本机 DSH 安装复制成救援快照（复制代码，约 200+ MB；不含你的会话、工作区、存储与设置）。\n\n继续？",
+                "重建快照", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            if (answer != MessageBoxResult.Yes) return;
 
-        await RunScriptAsync(BuildArgs("create"), "重建快照（create）", "create");
-        RefreshStatusLine();
+            await RunScriptAsync(BuildArgs("create"), "重建快照（create）", "create");
+            RefreshStatusLine();
+        }
+        catch (Exception ex)
+        {
+            Safe.Report("RescuePanel.BtnRebuild_Click", ex);
+            Safe.Run("RescuePanel.BtnRebuild_Click.Log", () => AppendSystem($"重建快照失败：{ex.Message}"));
+        }
     }
 
     private void BtnClearChat_Click(object sender, RoutedEventArgs e)
@@ -702,9 +711,17 @@ public partial class RescuePanel : UserControl, INotifyPropertyChanged
 
     private async void BtnHealth_Click(object sender, RoutedEventArgs e)
     {
-        if (_busy > 0) return;
-        await RunScriptAsync(BuildArgs("status"), "体检（status）", "status");
-        RefreshStatusLine();
+        try
+        {
+            if (_busy > 0) return;
+            await RunScriptAsync(BuildArgs("status"), "体检（status）", "status");
+            RefreshStatusLine();
+        }
+        catch (Exception ex)
+        {
+            Safe.Report("RescuePanel.BtnHealth_Click", ex);
+            Safe.Run("RescuePanel.BtnHealth_Click.Log", () => AppendSystem($"体检失败：{ex.Message}"));
+        }
     }
 
     private string BuildArgs(string command)
@@ -846,11 +863,13 @@ public partial class RescuePanel : UserControl, INotifyPropertyChanged
         if (_detached) return;
         try
         {
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
             if (Dispatcher.CheckAccess()) action();
             else Dispatcher.Invoke(action);
         }
         catch (TaskCanceledException) { }
         catch (InvalidOperationException) { }
+        catch (Exception ex) { Safe.Report("RescuePanel.PostToUi", ex); }
     }
 
     private void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));

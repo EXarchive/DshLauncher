@@ -14,6 +14,19 @@ public partial class MainWindow : Window
     private readonly ProcessRunnerService _runner = new();
     private LauncherConfig _config = new();
     private readonly StringBuilder _logBuffer = new();
+
+    /// <summary>关闭流程是否已经走过一轮（防止 Stop→Close 触发的第二次 Closing 再进一次）。</summary>
+    private bool _closeConfirmed;
+
+    /// <summary>
+    /// 启动器自身日志落盘路径。之前日志只存在内存里的 TxtLogs，
+    /// 一闪而过、关窗即失，出问题（如状态误判）时完全无从取证。
+    /// 现在每条都追加写入按天分文件的日志，便于事后诊断。
+    /// </summary>
+    private static readonly string LauncherLogPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DshLauncher", "logs",
+        $"launcher-{DateTime.Now:yyyyMMdd}.log");
     private bool _webViewReady;
     /// <summary>
     /// 控件回填期间为 false。XAML 里 ChkHideConsole 的 IsChecked="True" 会在
@@ -71,7 +84,7 @@ public partial class MainWindow : Window
         _runner.OnStatusChanged += Runner_OnStatusChanged;
         _runner.OnAuthenticatedUrlDetected += authUrl =>
         {
-            Dispatcher.Invoke(() =>
+            PostToUi(() =>
             {
                 AppendLogLine($"[认证] 已捕获带 token 的访问地址: {authUrl}");
 
@@ -96,8 +109,8 @@ public partial class MainWindow : Window
         // 窗口最小化时挂起内嵌内核以节省内存
         StateChanged += MainWindow_StateChanged;
 
-        // 宿主关闭：置守卫，面板不再触碰控件（正在跑的救援命令不杀，让它跑完）
-        Closing += (_, _) => RescueSidebar.Detach();
+        // 宿主关闭：先结束 DSH 实例（含提权/SYSTEM），再放行关闭。
+        Closing += MainWindow_Closing;
     }
 
     /// <summary>
@@ -242,6 +255,36 @@ public partial class MainWindow : Window
             core.Settings.AreDevToolsEnabled = true;
             core.Settings.IsZoomControlEnabled = true;
 
+            // ── 渲染进程崩溃接管 ────────────────────────────────────────────
+            // 大会话（实测 17MB、renderer 吃 815MB）会先把渲染进程压垮，崩溃后
+            // WebView2 控件抛出的异常会沿 UI 线程冒泡。App.xaml.cs 的兜底能保住
+            // 进程不死，但控件此时已不可用 —— 这里显式接管，给出可恢复的路径。
+            core.ProcessFailed += (_, e) =>
+            {
+                try
+                {
+                    AppendLogLine($"[界面] WebView2 进程异常：{e.ProcessFailedKind}"
+                        + "（大会话把渲染进程内存撑爆是最常见诱因）");
+
+                    if (e.ProcessFailedKind == Microsoft.Web.WebView2.Core
+                            .CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+                    {
+                        // 卡死：重载一次，多数情况能恢复
+                        AppendLogLine("[界面] 渲染进程无响应，正在尝试重新加载…");
+                        try { core.Reload(); } catch { }
+                        return;
+                    }
+
+                    if (e.ProcessFailedKind == Microsoft.Web.WebView2.Core
+                            .CoreWebView2ProcessFailedKind.RenderProcessExited)
+                    {
+                        AppendLogLine("[界面] 渲染进程已退出；WebView2 会自动重建，"
+                            + "若页面空白请点「重新加载」。");
+                    }
+                }
+                catch { }
+            };
+
             // 兜底：「界面极其缩小」最常见的原因就是 WebView2 的缩放被持久化成极小值
             // （Ctrl+滚轮 或缩放控件），而且 Chromium 会把每站点的缩放存进 profile，
             // 重启也不恢复。这里每次内核就绪后强制回到 100%，配合 DPI 清单，
@@ -294,6 +337,16 @@ public partial class MainWindow : Window
 
         TxtArgs.Text = _config.CustomArguments;
         TxtPort.Text = _config.WebPort.ToString();
+
+        // 「释放端口」按钮直接标出当前 DSH 要用的端口，避免和"释放所有端口"混淆
+        Safe.Run("LoadConfiguration.PortButton", () =>
+        {
+            int p = _config.WebPort > 0 ? _config.WebPort : 3080;
+            BtnForcePort.Content = $"🔓 释放 {p}";
+            BtnForcePort.ToolTip =
+                $"强制结束所有占用端口 {p}（当前 DSH 要用的端口）的进程，含 SYSTEM 进程与子树。\n"
+                + "用于端口被残留实例占住、而普通「停止」对它无效的情况。";
+        });
         ChkAutoOpenBrowser.IsChecked = _config.AutoOpenBrowser;
         ChkAutoRestart.IsChecked = _config.AutoRestartOnCrash;
         ChkHideConsole.IsChecked = _config.HideConsole;
@@ -425,7 +478,7 @@ public partial class MainWindow : Window
 
     private void Runner_OnStatusChanged(ProcessStatus status)
     {
-        Dispatcher.Invoke(() =>
+        PostToUi(() =>
         {
             switch (status)
             {
@@ -434,8 +487,12 @@ public partial class MainWindow : Window
                         (System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#475569"));
                     TxtStatusBadge.Text = "已停止 (Stopped)";
                     BtnStart.IsEnabled = true;
-                    BtnStop.IsEnabled = false;
-                    TxtFooterInfo.Text = "就绪 - 服务未运行";
+                    // 状态可能被误判（真实例仍在跑）。此时仍要能停 ——
+                    // 否则会出现「显示未运行、又停不掉」的死局。
+                    BtnStop.IsEnabled = _runner.IsInstanceAlive();
+                    TxtFooterInfo.Text = BtnStop.IsEnabled
+                        ? "状态显示已停止，但检测到实例仍在运行 —— 可点「停止」强制结束"
+                        : "就绪 - 服务未运行";
                     break;
                 case ProcessStatus.Starting:
                     BadgeStatus.Background = new System.Windows.Media.SolidColorBrush(
@@ -481,17 +538,93 @@ public partial class MainWindow : Window
 
     private void Runner_OnLogReceived(string message, bool isError)
     {
-        Dispatcher.Invoke(() =>
+        PostToUi(() =>
         {
             string prefix = isError ? "[错误] " : "";
             AppendLogLine($"{prefix}{message}");
         });
     }
 
+    /// <summary>
+    /// 关闭软件时自动结束 DSH 实例（含提权 / SYSTEM）。
+    ///
+    /// Closing 是同步事件、StopAsync 是异步的，所以先挂起本次关闭（e.Cancel = true），
+    /// await 停止完成后再调 Close() 真正退出；_closeConfirmed 防止递归。
+    /// 没有存活实例时立即放行，不拖延关窗。
+    /// </summary>
+    private async void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        // async void 的异常无人可接 —— 必须以 Safe 收口，否则关闭流程出错会把
+        // 进程带崩（关闭时崩溃最糟：DSH 可能停在半停止状态）。
+        try
+        {
+            // 面板先脱钩，避免停止过程中它还在触碰控件
+            try { RescueSidebar.Detach(); } catch { }
+
+            if (_closeConfirmed) return;
+            _closeConfirmed = true;
+
+            if (!_runner.IsInstanceAlive())
+            {
+                return;   // 没有存活实例，直接放行
+            }
+
+            // 必须在第一个 await 之前设置：Closing 处理器一 await 就"返回"了，
+            // 之后再改 e.Cancel 不会生效。
+            e.Cancel = true;
+
+            AppendLogLine("[系统] 正在结束 DSH 实例（关闭软件自动清理）…");
+
+            bool ok = await Safe.TryAsync("MainWindow_Closing.StopAsync", () => _runner.StopAsync());
+            Safe.Run("MainWindow_Closing.Log", () => AppendLogLine(
+                ok ? "[系统] 实例已结束，可以安全退出。"
+                   : "[系统] 实例未能完全结束，请检查任务管理器。"));
+
+            // 再来一次，这次 _closeConfirmed 已置位，直接放行
+            Safe.Run("MainWindow_Closing.Close", Close);
+        }
+        catch (Exception ex)
+        {
+            Safe.Report("MainWindow_Closing", ex);
+            // 关闭流程本身出错时绝不能把程序卡死在"关不掉"的状态
+            try { e.Cancel = false; } catch { }
+            try { Close(); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// 安全地把动作编组到 UI 线程。
+    ///
+    /// 这三类回调（认证地址、状态变化、日志）都来自后台线程，窗口关闭或正在销毁时
+    /// Dispatcher.Invoke 会抛 TaskCanceledException / InvalidOperationException。
+    /// 它们不是 async void，抛出去无人接住就会打死进程 —— 必须在这里吞掉。
+    /// </summary>
+    private void PostToUi(Action action)
+    {
+        try
+        {
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            if (Dispatcher.CheckAccess()) action();
+            else Dispatcher.Invoke(action);
+        }
+        catch (TaskCanceledException) { }
+        catch (InvalidOperationException) { }
+        catch (Exception ex) { Safe.Report("MainWindow.PostToUi", ex); }
+    }
+
     private void AppendLogLine(string line)
     {
         string formatted = $"[{DateTime.Now:HH:mm:ss}] {line}\r\n";
         _logBuffer.Append(formatted);
+
+        // 落盘：任何排查都要靠它，写失败也不能影响 UI
+        try
+        {
+            string? dir = Path.GetDirectoryName(LauncherLogPath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.AppendAllText(LauncherLogPath, formatted, Encoding.UTF8);
+        }
+        catch { }
 
         if (_logBuffer.Length > 200000)
         {
@@ -510,6 +643,13 @@ public partial class MainWindow : Window
     }
 
     private async void BtnStart_Click(object sender, RoutedEventArgs e)
+    {
+        // async void：异常无人可接，必须在这里收口
+        try { await BtnStartCoreAsync(); }
+        catch (Exception ex) { Safe.Report("BtnStart_Click", ex); }
+    }
+
+    private async Task BtnStartCoreAsync()
     {
         SaveCurrentUiToConfig();
         if (string.IsNullOrWhiteSpace(_config.DshPath))
@@ -530,12 +670,110 @@ public partial class MainWindow : Window
         await _runner.StartAsync(_config);
     }
 
-    private async void BtnStop_Click(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// 强制释放 Web 端口：结束所有占用该端口的进程（含 SYSTEM 进程与子树）。
+    ///
+    /// 与「停止」的区别：停止走启动器自己记录的实例句柄；本功能**不依赖任何句柄**，
+    /// 直接按端口反查占用者再强杀 —— 用于端口被「不归本启动器管理」的残留实例占住时。
+    /// </summary>
+    private async void BtnForcePort_Click(object sender, RoutedEventArgs e)
     {
-        await _runner.StopAsync();
+        try { await BtnForcePortCoreAsync(); }
+        catch (Exception ex) { Safe.Report("BtnForcePort_Click", ex); }
+    }
 
-        // 服务停止后立即释放 Chromium 内嵌内核占用的内存
-        await ReleaseEmbeddedCoreAsync();
+    private async Task BtnForcePortCoreAsync()
+    {
+        int port = _config.WebPort > 0 ? _config.WebPort : 3080;
+
+        // 第一步：实测能不能 bind —— 这是唯一可靠的判据。
+        // 只看 netstat 会把「崩溃后留下的 TIME_WAIT」当成「端口空闲」。
+        var diag = PortKiller.Diagnose(port);
+
+        if (diag.Bindable)
+        {
+            AppendLogLine($"[端口] {port} 当前可用，无需处理。");
+            return;
+        }
+
+        // 第二步：有进程占用 → 确认后强杀
+        if (diag.OwnerPids.Count > 0)
+        {
+            string desc = PortKiller.DescribeOwners(diag.OwnerPids);
+            var confirm = MessageBox.Show(this,
+                $"将强制结束占用端口 {port} 的进程：\n\n{desc}\n\n"
+                + "这会中断它们正在进行的对话；如果正是当前在用的 DSH，本界面会随之断开。\n\n继续？",
+                "强制释放端口", MessageBoxButton.YesNo, MessageBoxImage.Warning,
+                MessageBoxResult.No);
+
+            if (confirm != MessageBoxResult.Yes)
+            {
+                AppendLogLine("[端口] 已取消强制释放。");
+                return;
+            }
+
+            AppendLogLine($"[端口] 正在强制结束 {desc}…");
+            var after = await PortKiller.KillAsync(port);
+            AppendLogLine(after.Bindable ? $"[端口] ✓ {after.Detail}" : $"[端口] ✗ {after.Detail}");
+
+            if (after.Bindable)
+            {
+                Safe.Run("BtnForcePort.ResetState", () =>
+                {
+                    if (_runner.Status != ProcessStatus.Stopped) _runner.NotifyExternallyStopped();
+                });
+                return;
+            }
+
+            diag = after;   // 杀完仍不可用 → 落到换端口分支
+        }
+
+        // 第三步：没有进程可杀（TIME_WAIT 残留 / 归属查不到）→ 提供换端口立刻启动
+        int alt = PortKiller.FindFreePort(port + 1);
+        if (alt == port)
+        {
+            AppendLogLine($"[端口] ✗ {diag.Detail}");
+            AppendLogLine("[端口] 附近 50 个端口都不可用，请手工改端口。");
+            return;
+        }
+
+        var useAlt = MessageBox.Show(this,
+            $"{diag.Detail}\n\n"
+            + $"建议改用端口 {alt} 立即启动（配置里的端口会一并更新）。\n"
+            + "原端口的 TIME_WAIT 会在几分钟内自然回收，不影响继续使用。\n\n现在切换吗？",
+            "端口不可用", MessageBoxButton.YesNo, MessageBoxImage.Question,
+            MessageBoxResult.Yes);
+
+        if (useAlt != MessageBoxResult.Yes)
+        {
+            AppendLogLine("[端口] 保持原端口不变。");
+            return;
+        }
+
+        Safe.Run("BtnForcePort.SwitchPort", () =>
+        {
+            _config.WebPort = alt;
+            TxtPort.Text = alt.ToString();
+            BtnForcePort.Content = $"🔓 释放 {alt}";
+            SaveCurrentUiToConfig();
+        });
+
+        AppendLogLine($"[端口] 已改用端口 {alt}，点「启动」即可继续（原端口会自然回收）。");
+    }
+
+    private async void BtnStop_Click(object sender, RoutedEventArgs e)
+    {        try
+        {
+            await _runner.StopAsync();
+
+            // 服务停止后立即释放 Chromium 内嵌内核占用的内存
+            await ReleaseEmbeddedCoreAsync();
+        }
+        catch (Exception ex)
+        {
+            Safe.Report("BtnStop_Click", ex);
+            Safe.Run("BtnStop_Click.Log", () => AppendLogLine($"[错误] 停止流程异常：{ex.Message}"));
+        }
     }
 
     /// <summary>
@@ -543,6 +781,12 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task ReleaseEmbeddedCoreAsync()
     {
+        // 先把「释放中」标记立起来：下面有 await，期间窗口状态变化会再次进入
+        // MainWindow_StateChanged。若不提前标记，它就会拿到一个正在销毁的控件并抛
+        // "CoreWebView2 members cannot be accessed after the WebView2 control is disposed"
+        // —— 实测一天刷了 56 条 safe 日志。
+        _webViewDisposed = true;
+
         try
         {
             if (MainWebView.CoreWebView2 != null)
@@ -562,8 +806,8 @@ public partial class MainWindow : Window
             AppendLogLine($"[内存] 释放内嵌内核时出现异常（已忽略）: {ex.Message}");
         }
 
-        // Dispose 之后这个实例就废了：从可视树摘掉，并标记需要重建。
-        // 绝不能再读它的属性或设 Visibility —— 那正是 disposed object 异常的来源。
+        // Dispose 之后这个实例就废了：从可视树摘掉。
+        // _webViewDisposed 已在本方法开头提前置位（见上方注释），这里保留重复赋值只为可读性。
         try { WebHost.Children.Remove(MainWebView); } catch { }
         _webViewDisposed = true;
 
@@ -582,11 +826,11 @@ public partial class MainWindow : Window
     /// </summary>
     private async void MainWindow_StateChanged(object? sender, EventArgs e)
     {
-        if (_webViewDisposed) return;
-        if (MainWebView.CoreWebView2 == null) return;
-
         try
         {
+            if (_webViewDisposed) return;
+            if (MainWebView.CoreWebView2 == null) return;
+
             if (WindowState == WindowState.Minimized)
             {
                 MainWebView.CoreWebView2.MemoryUsageTargetLevel =
@@ -603,7 +847,20 @@ public partial class MainWindow : Window
                 _webViewSuspended = false;
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            // 控件在 await 期间被释放属于正常生命周期竞争，不是故障 ——
+            // 记下来只会把 safe 日志刷满（实测 56 条/天）。
+            // ObjectDisposedException 派生自 InvalidOperationException，一并覆盖。
+            if (ex is InvalidOperationException)
+            {
+                _webViewSuspended = false;
+                return;
+            }
+
+            // 其余挂起/恢复失败不影响主流程，但必须记录；不记录就查不出内存异常
+            Safe.Report("MainWindow_StateChanged", ex);
+        }
     }
 
     private void ResumeEmbeddedCore()
@@ -806,21 +1063,22 @@ public partial class MainWindow : Window
 
     private async void LoadEmbeddedBrowser(string? specificUrl = null)
     {
-        string? authenticated = !string.IsNullOrWhiteSpace(specificUrl)
-            ? specificUrl
-            : _runner.LastAuthenticatedUrl;
-
-        if (string.IsNullOrWhiteSpace(authenticated))
-        {
-            AppendLogLine("[提示] 尚未捕获到 DSH 的认证地址，请先启动服务；");
-            AppendLogLine("       直接访问裸端口会触发 authentication required（web 有浏览器信任围栏）。");
-            return;
-        }
-
-        string url = authenticated;
-
+        // async void：整个方法体都在守护范围内，包括取 URL 和写日志
         try
         {
+            string? authenticated = !string.IsNullOrWhiteSpace(specificUrl)
+                ? specificUrl
+                : _runner.LastAuthenticatedUrl;
+
+            if (string.IsNullOrWhiteSpace(authenticated))
+            {
+                AppendLogLine("[提示] 尚未捕获到 DSH 的认证地址，请先启动服务；");
+                AppendLogLine("       直接访问裸端口会触发 authentication required（web 有浏览器信任围栏）。");
+                return;
+            }
+
+            string url = authenticated;
+
             // 必须在设 Visibility 之前重建：已 Dispose 的实例连 Visibility 都不能碰
             EnsureWebViewInstance();
 
@@ -830,7 +1088,8 @@ public partial class MainWindow : Window
             if (!await EnsureWebViewReadyAsync())
             {
                 AppendLogLine("[提示] 内嵌内核不可用，已改用系统默认浏览器打开。");
-                Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+                Safe.Run("LoadEmbeddedBrowser.OpenExternal", () =>
+                    Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true }));
                 return;
             }
 
@@ -839,7 +1098,9 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLogLine($"[错误] 加载内嵌视图失败: {ex.Message}");
+            Safe.Report("LoadEmbeddedBrowser", ex);
+            Safe.Run("LoadEmbeddedBrowser.Log", () =>
+                AppendLogLine($"[错误] 加载内嵌视图失败: {ex.Message}"));
         }
     }
 

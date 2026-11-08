@@ -42,6 +42,60 @@ public class ProcessRunnerService
 
         try
         {
+            // 0. 端口占用检查 ────────────────────────────────────────────────
+            // 端口被占有两种情况，必须区别对待：
+            //   ① 本启动器上次残留的实例（node.pid 里的 PID 正是监听者）→ 可以清理
+            //   ② 另一个实例正在正常使用（例如用户已有一个 DSH 在跑）→ 绝不能杀
+            // 之前只要端口被占就按端口执行停止脚本，会把正在用的实例一起干掉，
+            // 还会和「新实例 bind 失败」串成死循环。
+            int portToCheck = instance?.Port ?? (config.WebPort > 0 ? config.WebPort : 3080);
+
+            // 用「能不能真的 bind」判断，而不是「有没有连接」。
+            // 崩溃后留下的 TIME_WAIT 是内核持有、没有进程在服务的，
+            // 新实例可以直接复用该端口（已实测验证）——把它当成"被占用"会拒绝掉
+            // 本来完全能成功的启动（2026-11-06 22:16 日志：明明能起却提示端口被占用）。
+            if (!PortKiller.CanBind(portToCheck))
+            {
+                int? ownerPid = PrivilegeLauncher.FindPortOwnerPid(portToCheck);
+
+                bool ownStale;
+                var probe = new PrivilegeLauncher();
+                try
+                {
+                    if (ownerPid.HasValue && ownerPid.Value > 0)
+                    {
+                        // 能查到归属：必须与 node.pid 记录一致，才认定是自己的残留
+                        ownStale = probe.TryGetPid(out int recordedPid) && recordedPid == ownerPid.Value;
+                    }
+                    else
+                    {
+                        // 归属未知（SYSTEM 进程监听端口时 netstat 常报 PID 0）：
+                        // 用「node.pid 记录的进程还活着」来判定是不是自己的残留。
+                        ownStale = probe.IsProcessAlive();
+                    }
+                }
+                catch { ownStale = false; }
+                finally { probe.Dispose(); }
+
+                if (ownStale)
+                {
+                    Log($"[提示] 端口 {portToCheck} 被上次残留的实例占用（PID {ownerPid}），先结束它再启动…", true);
+                    var stale = new PrivilegeLauncher();
+                    try { await stale.StopAsync(); }
+                    catch (Exception ex) { Log($"[提示] 清理残留实例失败：{ex.Message}", true); }
+                    finally { stale.Dispose(); }
+                    await Task.Delay(800);
+                }
+                else
+                {
+                    Log($"[提示] 端口 {portToCheck} 已被占用（PID {ownerPid?.ToString() ?? "未知"}），"
+                        + "它不是本启动器的残留实例，不会强行结束。", true);
+                    Log("[提示] 请先停止该实例，或把端口改成别的值后再启动。", true);
+                    SetStatus(ProcessStatus.Stopped);
+                    return false;
+                }
+            }
+
             // 1. Run Pre-start Extensions
             // 实例模式下刻意跳过：这些扩展来自启动器的全局配置，若为某个非主实例执行，
             // 就可能运行到面向主工作区（:3080）的命令——实例隔离里唯一可能越过边界的地方。
@@ -310,37 +364,88 @@ public class ProcessRunnerService
     }
 
     /// <summary>
-    /// 提权模式下唯一可用的存活信号是端口：进程句柄在 UAC / 计划任务边界之外。
-    /// 端口掉了就说明实例没了 —— 否则界面会一直停在「运行中」。
+    /// 提权模式的实例监测：进程句柄在 UAC / 计划任务边界之外，只能用「间接存活信号」。
+    ///
+    /// 两个信号，任一为真即视为活着：
+    ///   ① 端口监听 —— IPGlobalProperties.GetActiveTcpListeners()
+    ///   ② node.pid 里的 PID 仍存活 —— PrivilegeLauncher.IsProcessAlive()
+    ///
+    /// 旧实现只用 ①，且 8.5 秒就判死。个别环境下 ① 会漏报目标端口，于是活着的实例
+    /// 被标成「已停止」：UI 显示"服务未运行"，停止按钮同时被禁用（Stopped 分支会
+    /// 关掉 BtnStop），表现就是"显示未运行、又停不掉"。加上 ② 和逐段诊断日志后，
+    /// 既不会再误判，真出问题时也能从日志看出是哪一环没等到。
     /// </summary>
     private void WatchPrivileged(int port)
     {
         var priv0 = _privilege;
         if (priv0 == null) return;
 
-        _ = Task.Run(async () =>
+        // 用 Safe.RunBackground 而不是裸 Task.Run：监测循环里的任何异常
+        // （端口查询失败、PID 读取失败、状态被并发改动）都不会变成未观察异常。
+        _ = Safe.RunBackground("WatchPrivileged", async () =>
         {
             // ── 阶段一：启动宽限期 ──────────────────────────────────────────
-            // DSH 从进程启动到端口 bind 需要十几秒（插件多时更久）。
-            // 旧实现固定等 6s + 2.5s 就判死，而实测启动要 13s —— 于是每次启动都会
-            // 误报「端口已不再监听：提权实例已结束」，把状态错置为 Stopped，
-            // 紧接着 WebView2 初始化就撞上这个已被判死的状态（RPC_E_DISCONNECTED）。
-            // 正确做法：先等它「首次监听成功」，之后再监控它是否掉线。
-            const int startupGraceMs = 90_000;
+            // DSH 从进程启动到端口 bind 需要十几秒（插件多时更久），
+            // 这段时间「还没有信号」是正常的，不能当成「实例已结束」。
+            const int startupGraceMs = 120_000;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             bool everListened = false;
+            bool everAlive = false;
+            var nextDiag = TimeSpan.FromSeconds(15);
 
             while (sw.ElapsedMilliseconds < startupGraceMs)
             {
-                if (!ReferenceEquals(priv0, _privilege)) return;
-                if (Status != ProcessStatus.Running) return;   // 已被别处停止
-                if (PrivilegeLauncher.IsPortListening(port)) { everListened = true; break; }
+                if (!ReferenceEquals(priv0, _privilege))
+                {
+                    Log("[监测] 实例对象已被替换，本次监控退出。", false);
+                    return;
+                }
+                if (Status != ProcessStatus.Running)
+                {
+                    Log($"[监测] 状态已变为 {Status}（非运行中），本次监控退出。", false);
+                    return;
+                }
+
+                // 就绪的判据优先是「**我自己的进程**正在监听这个端口」。
+                // 只看 IsPortListening(port) 会把「端口被上一个还没退干净的实例占着」
+                // 误判成「已就绪」——紧接着 DSH 自己报 EADDRINUSE 退出，形成
+                // 「就绪 → 判死 → 清理 → 再启动 → 再 EADDRINUSE」的死循环。
+                bool aliveOk = priv0.IsProcessAlive();
+                int? ownerPid = PrivilegeLauncher.FindPortOwnerPid(port);
+                int? myPid = null;
+                if (priv0.TryGetPid(out int tmpPid)) myPid = tmpPid;
+
+                bool ownListening;
+                if (ownerPid.HasValue && ownerPid.Value > 0 && myPid.HasValue)
+                {
+                    // 能查到归属：必须是自己，才算就绪
+                    ownListening = ownerPid.Value == myPid.Value;
+                }
+                else
+                {
+                    // 查不到归属（SYSTEM 进程监听端口时 netstat 常报 PID 0）：
+                    // 不能因为"归属未知"就判死，回退到「端口在听 + 自己的进程还活着」。
+                    ownListening = aliveOk && PrivilegeLauncher.IsPortListening(port);
+                }
+
+                if (ownListening) { everListened = true; everAlive = true; break; }
+                if (aliveOk) everAlive = true;
+
+                // 每 15 秒留一条诊断，避免"起来了却判死"时无从判断是哪一环失败
+                if (sw.Elapsed >= nextDiag)
+                {
+                    string ownerText = ownerPid.HasValue ? ownerPid.Value.ToString() : "无";
+                    string myPidText = myPid.HasValue ? myPid.Value.ToString() : "无";
+                    Log($"[监测] 等待实例就绪 {sw.Elapsed.TotalSeconds:F0}s：端口监听者={ownerText}，"
+                        + $"本实例PID={myPidText}，进程存活={aliveOk}", false);
+                    nextDiag += TimeSpan.FromSeconds(15);
+                }
                 await Task.Delay(400);
             }
 
-            if (!everListened)
+            if (!everListened && !everAlive)
             {
-                Log($"[系统] 端口 {port} 在 {startupGraceMs / 1000} 秒内始终未监听：提权实例启动失败。", true);
+                Log($"[监测] {startupGraceMs / 1000} 秒内既没等到本实例监听端口 {port}，也没等到进程存活：判定启动失败。", true);
                 lock (_lock)
                 {
                     if (ReferenceEquals(priv0, _privilege)) SetStatus(ProcessStatus.Stopped);
@@ -348,7 +453,20 @@ public class ProcessRunnerService
                 return;
             }
 
-            Log($"[系统] 端口 {port} 已就绪，转入掉线监控。", false);
+            if (!everListened)
+            {
+                // 进程活着但始终没自己监听：典型是 DSH 启动后因端口冲突/配置错误自行退出。
+                Log($"[监测] 本实例进程曾存活但始终未监听端口 {port}：判定启动失败。", true);
+                lock (_lock)
+                {
+                    if (ReferenceEquals(priv0, _privilege)) SetStatus(ProcessStatus.Stopped);
+                }
+                return;
+            }
+
+            string okPidText = "?";
+            if (priv0.TryGetPid(out int okPid)) okPidText = okPid.ToString();
+            Log($"[监测] 本实例已就绪（PID {okPidText} 正在监听 {port}），转入掉线监控。", false);
 
             // ── 阶段二：掉线监控 ────────────────────────────────────────────
             while (true)
@@ -356,9 +474,12 @@ public class ProcessRunnerService
                 await Task.Delay(2500);
                 if (!ReferenceEquals(priv0, _privilege)) return;
                 if (Status != ProcessStatus.Running) continue;
-                if (PrivilegeLauncher.IsPortListening(port)) continue;
 
-                Log($"[系统] 端口 {port} 已不再监听：提权实例已结束。", true);
+                // 进入阶段二时已确认过「本实例曾经在监听」，所以掉线只需看
+                // 自己那个 PID 还在不在 —— 端口会被别的进程复用，拿端口判断会误判。
+                if (priv0.IsProcessAlive()) continue;
+
+                Log($"[监测] 本实例进程已退出：提权实例已结束。", true);
                 lock (_lock)
                 {
                     if (ReferenceEquals(priv0, _privilege)) SetStatus(ProcessStatus.Stopped);
@@ -368,9 +489,51 @@ public class ProcessRunnerService
         });
     }
 
-    public async Task<bool> StopAsync()
+    /// <summary>
+    /// 外部已经把实例结束掉了（例如「强制释放端口」按端口强杀）——
+    /// 把内部状态拉回 Stopped，让界面与事实一致，避免停在「运行中」却连不上。
+    /// </summary>
+    public void NotifyExternallyStopped()
     {
-        // 提权 / SYSTEM：普通路径走不通（taskkill 无权结束提权进程），必须用提权脚本。
+        lock (_lock)
+        {
+            try { _privilege?.Dispose(); } catch { }
+            _privilege = null;
+            _currentProcess = null;
+            SetStatus(ProcessStatus.Stopped);
+        }
+    }
+
+    /// <summary>
+    /// 实例是否**实际**还活着（提权 PID 存活，或普通模式子进程未退出）。
+    ///
+    /// 用途：即使 UI 状态被误判成 Stopped，也据此保留「停止」按钮可用性，
+    /// 避免出现「显示未运行、又停不掉」的死局；关闭软件时也靠它决定要不要善后。
+    /// </summary>
+    public bool IsInstanceAlive()
+    {
+        var priv = _privilege;
+        if (priv != null && priv.IsProcessAlive()) return true;
+
+        var p = _currentProcess;
+        if (p != null)
+        {
+            try { return !p.HasExited; } catch { }
+        }
+
+        // 提权模式兜底：_privilege 可能已被置空（停止过 / 启动器重启过），
+        // 但固定路径的 node.pid 仍指向存活进程。探测一次，避免"活着却判死"。
+        try
+        {
+            var probe = new PrivilegeLauncher();
+            try { return probe.IsProcessAlive(); }
+            finally { probe.Dispose(); }
+        }
+        catch { return false; }
+    }
+
+    public async Task<bool> StopAsync()
+    {        // 提权 / SYSTEM：普通路径走不通（taskkill 无权结束提权进程），必须用提权脚本。
         var privToStop = _privilege;
         if (privToStop != null)
         {
@@ -391,6 +554,31 @@ public class ProcessRunnerService
                 if (ReferenceEquals(privToStop, _privilege)) _privilege = null;
             }
             Log("[系统] 提权实例已停止。", false);
+            SetStatus(ProcessStatus.Stopped);
+            return true;
+        }
+
+        // ── 兜底：没有提权句柄，但实例可能仍活着 ──
+        // 场景：状态被误判后用户再点停止、上次停止中途失败、启动器重启过
+        // （_privilege 丢了，但固定路径的 node.pid 还在）。
+        // 新建一个 PrivilegeLauncher 善后：它按 launch.json 的端口 + node.pid 结束进程。
+        if (IsInstanceAlive())
+        {
+            Log("[停止] 未持有提权句柄，但检测到实例仍在运行，改用 PID/端口兜底停止…", true);
+            lock (_lock) { SetStatus(ProcessStatus.Stopping); }
+
+            var recover = new PrivilegeLauncher();
+            try { await recover.StopAsync(); }
+            catch (Exception ex) { Log($"[停止异常] {ex.Message}", true); }
+            finally { recover.Dispose(); }
+
+            if (IsInstanceAlive())
+            {
+                Log("[停止] 兜底停止后实例仍在运行，请在任务管理器结束 node.exe。", true);
+                SetStatus(ProcessStatus.Error);
+                return false;
+            }
+            Log("[系统] 兜底停止成功。", false);
             SetStatus(ProcessStatus.Stopped);
             return true;
         }
@@ -680,6 +868,18 @@ public class ProcessRunnerService
                     psi.Environment[kv.Key] = kv.Value;
                 }
             }
+        }
+
+        // 3. Node 堆上限：用户要求「内存无上限」，把约束交给操作系统。
+        //    放在 CustomEnv 之后，这样用户自己设的 NODE_OPTIONS 会被尊重（只追加不覆盖）。
+        try
+        {
+            psi.Environment.TryGetValue(NodeMemoryOptions.EnvName, out var existingNodeOpts);
+            psi.Environment[NodeMemoryOptions.EnvName] = NodeMemoryOptions.BuildValue(existingNodeOpts);
+        }
+        catch (Exception ex)
+        {
+            Safe.Report("SetupEnvironmentVariables.NodeHeap", ex);
         }
     }
 
