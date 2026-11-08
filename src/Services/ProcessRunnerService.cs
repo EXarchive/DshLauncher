@@ -34,7 +34,8 @@ public class ProcessRunnerService
         {
             if (Status == ProcessStatus.Running || Status == ProcessStatus.Starting)
             {
-                Log("服务已在运行或正在启动中...", true);
+                // 这是保护性提示（防止重复启动），不是错误 —— 标成 [错误] 会误导
+                Log("服务已在运行或正在启动中，已忽略本次启动请求。", false);
                 return false;
             }
             SetStatus(ProcessStatus.Starting);
@@ -79,7 +80,7 @@ public class ProcessRunnerService
 
                 if (ownStale)
                 {
-                    Log($"[提示] 端口 {portToCheck} 被上次残留的实例占用（PID {ownerPid}），先结束它再启动…", true);
+                    Log($"[提示] 端口 {portToCheck} 被上次残留的实例占用（PID {ownerPid}），先结束它再启动…", false);
                     var stale = new PrivilegeLauncher();
                     try { await stale.StopAsync(); }
                     catch (Exception ex) { Log($"[提示] 清理残留实例失败：{ex.Message}", true); }
@@ -90,7 +91,7 @@ public class ProcessRunnerService
                 {
                     Log($"[提示] 端口 {portToCheck} 已被占用（PID {ownerPid?.ToString() ?? "未知"}），"
                         + "它不是本启动器的残留实例，不会强行结束。", true);
-                    Log("[提示] 请先停止该实例，或把端口改成别的值后再启动。", true);
+                    Log("[提示] 请先停止该实例，或把端口改成别的值后再启动。", false);
                     SetStatus(ProcessStatus.Stopped);
                     return false;
                 }
@@ -564,7 +565,7 @@ public class ProcessRunnerService
         // 新建一个 PrivilegeLauncher 善后：它按 launch.json 的端口 + node.pid 结束进程。
         if (IsInstanceAlive())
         {
-            Log("[停止] 未持有提权句柄，但检测到实例仍在运行，改用 PID/端口兜底停止…", true);
+            Log("[停止] 未持有提权句柄，但检测到实例仍在运行，改用 PID/端口兜底停止…", false);
             lock (_lock) { SetStatus(ProcessStatus.Stopping); }
 
             var recover = new PrivilegeLauncher();

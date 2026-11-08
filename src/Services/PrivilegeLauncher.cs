@@ -462,8 +462,46 @@ exit 0
     {
         StopTailing();
         _tailers.Add(new FileTailer(_logOut, false, (line, isErr) => OnLog?.Invoke(line, isErr)));
-        _tailers.Add(new FileTailer(_logErr, true, (line, isErr) => OnLog?.Invoke(line, isErr)));
+
+        // dsh.err.log 里的一切默认都算 stderr，但其中混着大量正常信息
+        // （model listing、插件版本闸门、快照上限提示…）。不区分就全标成 [错误]，
+        // 一天能刷几十条，真正的问题反而被淹没。
+        _tailers.Add(new FileTailer(_logErr, true,
+            (line, isErr) => OnLog?.Invoke(line, isErr && !IsBenignStderr(line))));
+
         foreach (var t in _tailers) t.Start();
+    }
+
+    /// <summary>
+    /// 判断某条 stderr 输出其实只是「信息 / 警告」，不是错误。
+    ///
+    /// 采用**白名单**：只放行明确认识的信息型输出，其余一律仍按错误处理，
+    /// 避免把真正的崩溃信息（startup failed / fatal uncaught exception / EADDRINUSE…）吞掉。
+    /// </summary>
+    private static bool IsBenignStderr(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return true;
+
+        // ① 已知的信息型输出
+        if (line.Contains("model listing", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("recall shell dialect probe", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("ExperimentalWarning", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("trace-warnings", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("recall snapshot disabled", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("plugin loaded", StringComparison.OrdinalIgnoreCase)) return true;
+
+        // ② 插件版本闸门：是「被跳过」的警告，不是崩溃
+        if (line.Contains("skipping profile bundle", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("is incompatible with dsh", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("Running it may cause crashes or data loss", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("Exact-version exemption", StringComparison.OrdinalIgnoreCase)) return true;
+
+        // ③ 上面那些警告的续行（requirements JSON、插件清单表格）
+        string trimmed = line.TrimStart();
+        if (trimmed.StartsWith("{\"@deepseek-ai/", StringComparison.Ordinal)) return true;
+        if (trimmed.StartsWith("\"@deepseek-ai/", StringComparison.Ordinal)) return true;
+
+        return false;
     }
 
     private void StopTailing()
