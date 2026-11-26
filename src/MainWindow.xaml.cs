@@ -263,8 +263,40 @@ public partial class MainWindow : Window
             {
                 try
                 {
-                    AppendLogLine($"[界面] WebView2 进程异常：{e.ProcessFailedKind}"
-                        + "（大会话把渲染进程内存撑爆是最常见诱因）");
+                    AppendLogLine($"[界面] WebView2 进程异常：{e.ProcessFailedKind}");
+
+                    // ── 浏览器主进程整体退出 ────────────────────────────────
+                    // 这一类**必须重建控件**：core 已失效，Reload/Navigate 全都无效
+                    // （2026-11-26 12:57:44 实测：Crashpad 留下 9.2MB dump，
+                    //  此后内嵌浏览器进程全灭，界面只剩空壳）。
+                    if (e.ProcessFailedKind == Microsoft.Web.WebView2.Core
+                            .CoreWebView2ProcessFailedKind.BrowserProcessExited)
+                    {
+                        AppendLogLine("[界面] 浏览器进程已退出，正在重建内嵌内核…");
+                        _webViewReady = false;
+                        _webViewDisposed = true;   // 让 EnsureWebViewInstance 走重建分支
+
+                        Dispatcher.BeginInvoke(new Action(async () =>
+                        {
+                            try
+                            {
+                                if (!await EnsureWebViewReadyAsync())
+                                {
+                                    AppendLogLine("[界面] 重建失败，请点「刷新」或重启启动器。");
+                                    return;
+                                }
+
+                                string? url = _runner.LastAuthenticatedUrl;
+                                if (!string.IsNullOrWhiteSpace(url))
+                                {
+                                    MainWebView.CoreWebView2?.Navigate(url);
+                                    AppendLogLine("[界面] 内嵌内核已重建，正在重新连接。");
+                                }
+                            }
+                            catch (Exception ex) { Safe.Report("ProcessFailed.BrowserExitedRecover", ex); }
+                        }));
+                        return;
+                    }
 
                     if (e.ProcessFailedKind == Microsoft.Web.WebView2.Core
                             .CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
@@ -282,7 +314,7 @@ public partial class MainWindow : Window
                             + "若页面空白请点「重新加载」。");
                     }
                 }
-                catch { }
+                catch (Exception ex) { Safe.Report("ProcessFailed.Handler", ex); }
             };
 
             // 兜底：「界面极其缩小」最常见的原因就是 WebView2 的缩放被持久化成极小值

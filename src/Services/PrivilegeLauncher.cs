@@ -501,6 +501,12 @@ exit 0
         if (trimmed.StartsWith("{\"@deepseek-ai/", StringComparison.Ordinal)) return true;
         if (trimmed.StartsWith("\"@deepseek-ai/", StringComparison.Ordinal)) return true;
 
+        // ④ 插件已自行降级的提示（命令改名、内部吞掉的非致命状态）—— 都不是故障
+        if (line.Contains("is owned by another plugin", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("trying /", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("[usage-billing] swallowed", StringComparison.OrdinalIgnoreCase)) return true;
+        if (line.Contains("swallowed:", StringComparison.OrdinalIgnoreCase)) return true;
+
         return false;
     }
 
